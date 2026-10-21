@@ -13,10 +13,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load a model (only once)
-model = YOLO("yolo_model/train9/weights/best.pt")
+import os
 
-def detect_signatures_and_stamps(image_path):
-    """Detect signatures and stamps in the image."""
+# Model and confidence threshold (override with environment variables)
+MODEL_PATH = os.getenv("MODEL_PATH", "yolo_model/yolo26s_clean/weights/best.pt")
+# 0.3 = best F1 on the validation set (F1 is flat between ~0.25 and ~0.7)
+CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.3"))
+model = YOLO(MODEL_PATH)
+
+def detect_signatures_and_stamps(image_path, include_image=True):
+    """Detect signatures and stamps in the image.
+
+    If include_image is True, also return the image with boxes drawn on it (base64 JPEG).
+    """
     try:
         # Load the image from the given path
         image = cv2.imread(image_path)
@@ -24,7 +33,7 @@ def detect_signatures_and_stamps(image_path):
             raise ValueError(f"Failed to load image from {image_path}")
 
         # Perform detection
-        results = model(image)
+        results = model(image, conf=CONF_THRESHOLD)
         detections = []
 
         for result in results:
@@ -44,11 +53,16 @@ def detect_signatures_and_stamps(image_path):
                     "confidence": confidence
                 })
 
-        # Optionally save the annotated image and encode to base64
-        _, buffer = cv2.imencode('.jpg', image)
-        img_str = base64.b64encode(buffer).decode('utf-8')
+        output = {"detections": detections}
 
-        return {"detections": detections, "image_with_annotations": f"data:image/jpeg;base64,{img_str}"}
+        if include_image:
+            # Draw boxes and labels on the image and encode it as base64
+            annotated = results[0].plot() if results else image
+            _, buffer = cv2.imencode('.jpg', annotated)
+            img_str = base64.b64encode(buffer).decode('utf-8')
+            output["image_with_annotations"] = f"data:image/jpeg;base64,{img_str}"
+
+        return output
 
     except Exception as e:
         logger.error(f"Error in detect_signatures_and_stamps: {e}")
@@ -62,7 +76,7 @@ def get_sign_stamps(image_path):
         stamp_count = 0
 
         # Perform prediction using the preloaded model
-        results = model.predict([image_path])
+        results = model.predict([image_path], conf=CONF_THRESHOLD)
         result = results[0].boxes.cls.tolist()
 
         # Count the occurrences of signatures and stamps
@@ -96,7 +110,7 @@ def convert_to_png(input_image_path):
 
     except Exception as e:
         logger.error(f"Error in convert_to_png: {e}")
-        return f"Error occurred: {str(e)}"
+        raise ValueError(f"Error converting image: {e}")
 
 def pdf_pages_to_images(pdf_path, output_name):
     """Convert each page of a PDF to an image."""

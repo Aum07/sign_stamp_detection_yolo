@@ -5,12 +5,17 @@ import re
 import uuid
 import sys
 import warnings
+import logging
 from functions import detect_signatures_and_stamps, pdf_pages_to_images, convert_to_png
 
 if not sys.warnoptions:
     warnings.simplefilter("ignore")
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
+
+UPLOAD_DIR = Path("data")
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 def generate_uuid() -> str:
     """Generate and return a UUID as a string."""
@@ -34,73 +39,52 @@ async def test():
 @app.post("/detect")
 async def detect_certificates(
     file: UploadFile = File(...),
+    include_image: bool = True,
 ) -> Dict[str, Any]:
-    
+    """Detect signatures and stamps. Set include_image=false to skip the annotated image (much smaller response)."""
+    if not file or file.filename == '':
+        raise HTTPException(status_code=400, detail="No selected file")
+
+    # Every temporary file for this request starts with this UUID,
+    # so all of them can be deleted at the end, even if processing fails.
+    file_uuid = generate_uuid()
+    filename = secure_filename(f"{file_uuid}_" + Path(file.filename).suffix)
+    file_path = UPLOAD_DIR / filename
+
     try:
-        # Check if file is provided and not empty
-        if not file:
-            raise HTTPException(status_code=400, detail="No file part")
-        if file.filename == '':
-            raise HTTPException(status_code=400, detail="No selected file")
-
-        # Generate a UUID for the file
-        file_uuid = generate_uuid()
-
-        # Create a secure filename using UUID
-        filename = secure_filename(f"{file_uuid}_" + Path(file.filename).suffix)
-        file_path = f'data/{filename}'
-
         # Write uploaded file to disk
         with open(file_path, "wb") as buffer:
-            buffer.write(file.file.read())
+            buffer.write(await file.read())
 
         details = {}
 
         if file.content_type == 'application/pdf':
-            # Convert file_path to a Path object
-            file_path_obj = Path(file_path)
-            if not file_path_obj.is_file():
-                raise HTTPException(status_code=400, detail="File does not exist")
-
-            yolo_output = {"signatures": 0, "stamps": 0}
-            image_paths = pdf_pages_to_images(file_path_obj, file_uuid)  # Pass file_uuid here
-            i = 1
-            for image_path in image_paths:
+            image_paths = pdf_pages_to_images(file_path, file_uuid)
+            for i, image_path in enumerate(image_paths, start=1):
                 try:
-                    yolo_result = detect_signatures_and_stamps(image_path)
-                    details[f"page{i}"] = yolo_result
-                    i += 1
+                    details[f"page{i}"] = detect_signatures_and_stamps(image_path, include_image)
                 except Exception as e:
-                    # Handle OCR and YOLO processing errors
                     raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
-            
-            # Remove the original PDF file after processing
-            file_path_obj.unlink()
-
         else:
-            # Convert uploaded image to PNG
-            img = convert_to_png(file_path)
-
-            # Stamp and signature detection
             try:
-                yolo_output = detect_signatures_and_stamps(img)
+                img = convert_to_png(str(file_path))
             except Exception as e:
-                # Handle stamp and signature detection errors
+                raise HTTPException(status_code=400, detail=f"Could not read image: {str(e)}")
+            try:
+                details["page1"] = detect_signatures_and_stamps(img, include_image)
+            except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error performing sign and stamp detection: {str(e)}")
 
-            details = {
-                "page1": yolo_output,
-            }
-
-            # Remove the uploaded image file after processing
-            file_path_obj = Path(file_path)
-            file_path_obj.unlink()
-
         return details
-        
-    except HTTPException as http_err:
-        # Handle HTTP exceptions
-        raise http_err
+
+    except HTTPException:
+        raise
     except Exception as e:
-        # Handle other unexpected errors
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Delete the upload, converted PNG and PDF page images (they contain personal data)
+        for temp_file in UPLOAD_DIR.glob(f"{file_uuid}_*"):
+            try:
+                temp_file.unlink()
+            except OSError as e:
+                logger.warning(f"Could not delete temporary file {temp_file}: {e}")
