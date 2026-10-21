@@ -47,11 +47,11 @@ Full numbers, threshold choice and error analysis: [`reports/evaluation.md`](rep
 
 ## The data-leakage fix
 
-The first model (YOLOv8s, 800px, 250 epochs) reported 0.88 mAP@50 on validation. A leakage check (`tools/check_leakage.py`) compared every image across splits with perceptual hashes (pHash and dHash) and found **85 near-duplicate pairs**: the same certificate recoloured, greyscaled, brightened, or with its signature removed, uploaded as separate images and then split randomly. Roughly 15–30% of validation images had a copy in the training set.
+The first model (YOLOv8s, 800px, 250 epochs) reported 0.88 mAP@50 on validation. A leakage check (`tools/check_leakage.py`) compared every image across splits with perceptual hashes (pHash and dHash) and found **103 near-duplicate pairs**: the same certificate recoloured, greyscaled, brightened, or with its signature removed, uploaded as separate images and then split randomly. Roughly 15–30% of validation images had a copy in the training set.
 
 Fix (`tools/make_clean_split.py`):
 1. Group all images whose hashes differ by ≤ 8 bits (430 groups, largest 11 images).
-2. Assign **whole groups** to train / valid / test (70/20/10), choosing the assignment that best balances class counts.
+2. Shuffle the groups and assign **whole groups** to train / valid / test (70/20/10). (The split used for the model was also checked for balanced class counts; `reports/split_report.csv` records it exactly.)
 3. Re-run the leakage check: **zero** cross-split near-duplicates.
 4. Retrain from the pretrained checkpoint, not from the old model (which had already seen copies of the new test images).
 
