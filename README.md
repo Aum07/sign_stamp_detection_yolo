@@ -1,102 +1,137 @@
 # Signature & Stamp Detection API
 
-A FastAPI service that detects **signatures**, **stamps** and **signatures over stamps** ("mix") on uploaded certificates (images or multi-page PDFs). Built for a university application portal to check that uploaded internship certificates are signed and stamped.
+**In short:** an API that checks whether an uploaded certificate (image or PDF) has been signed and stamped. I built it for a university application portal, where students upload internship certificates.
 
-**Highlights**
-- Own dataset: 555 images (~350 photographed real certificates + ~205 certificate templates), annotated by hand in Roboflow.
-- Found that the original validation scores were inflated by **duplicate images leaking across train/valid/test**; rebuilt the split with perceptual hashing so no near-copy crosses splits.
-- Fine-tuned **YOLO26s** on the clean split. Clean held-out test set: **0.84 precision, 0.77 recall, 0.79 mAP@50**. The model finds **93%** of all marks; most errors are signature-vs-"mix" *label* confusion, not missed marks.
+- **The headline:** my first model scored 0.88, but that number was a lie. The same certificates had ended up in both the training and test data, so the model was being tested on images it had already seen.
+- **The fix:** I found 103 near-duplicate pairs using image fingerprints (perceptual hashing), rebuilt the split so no copy crosses between training and testing, and retrained from scratch.
+- **The honest result:** on a held-out test set it has never seen, the model scores **0.79 mAP@50**. On the validation set it finds **93% of all marks** if you ignore the labels; most of its mistakes are calling a signature a "signature over a stamp", not missing marks.
+- **Built on my own data:** 555 images, about 350 of them real certificates I photographed and labelled by hand.
 
 ![Example prediction on a certificate template](reports/example_prediction.jpg)
 
 *Example on a certificate template (placeholder names, no personal data). Real certificates are not shown.*
 
+**Built with:** Python, YOLO26 (Ultralytics), FastAPI, PyMuPDF, OpenCV, Roboflow, Docker
+
 ---
+
+## Why I built this
+
+A university portal needed to check that uploaded internship certificates were actually signed and stamped before a person reviewed them. Doing that by eye for hundreds of documents is slow and boring, so I trained a model to spot three things:
+
+- **Signatures**
+- **Stamps**
+- **"Mix"**: a signature written over a stamp
+
+## The story: my first score was too good to be true
+
+### What went wrong
+
+My first model (YOLOv8s) scored **0.88 mAP@50** on the validation set. That looked great, until I checked the data.
+
+While building the dataset, I'd often saved several versions of the same certificate: recoloured, greyscaled, brightened, or with the signature removed. These were uploaded as separate images and then split randomly into train, validation and test. So the same certificate could end up in both training and testing.
+
+That's like giving students the exam questions the day before. The score looks great, but it doesn't tell you how they'd do on new questions.
+
+### How I found it
+
+I wrote `tools/check_leakage.py`, which gives every image a fingerprint (pHash and dHash) and compares every image in one split against every image in the others. Two images that look nearly the same get nearly the same fingerprint.
+
+It found **103 near-duplicate pairs** across the splits. Roughly 15–30% of the validation images had a copy in the training set.
+
+### How I fixed it
+
+With `tools/make_clean_split.py`:
+
+1. **Group the copies.** Any images whose fingerprints differ by 8 bits or fewer go in the same group (430 groups; the biggest has 11 images).
+2. **Split by group, not by image.** Whole groups go into train, validation or test (70/20/10), so all versions of a certificate stay together. I also checked the class counts were balanced.
+3. **Check again.** Re-running the leakage check found **zero** duplicates across splits.
+4. **Retrain from scratch.** I started from the standard pretrained model, not my old one, because the old model had already seen copies of the new test images.
+
+`reports/split_report.csv` lists every image, where it was before, where it is now, and which group it belongs to.
+
+### Before and after
+
+| Model | Data | mAP@50 |
+|---|---|---|
+| YOLOv8s (first version) | leaky validation | 0.88 (inflated) |
+| YOLO26s | clean validation | 0.91 |
+| YOLO26s | **clean test** | **0.79** |
+
+One honest caveat: the old and new rows aren't a perfect comparison, because I changed both the data split and the model. A fair comparison would retrain YOLOv8s on the clean split (it's on the to-do list).
 
 ## Results
 
-Full numbers, threshold choice and error analysis: [`reports/evaluation.md`](reports/evaluation.md).
+### How to read the numbers
 
-### Test set (55 images, 61 marks, never used for any decision)
+- **Precision:** when the model says "that's a stamp", how often it's right.
+- **Recall:** of all the real stamps, how many the model found.
+- **mAP@50:** a single score combining both, counting a detection as correct if its box overlaps the real one by at least half. 1.0 is perfect.
 
-| Class | Precision | Recall | mAP@50 | mAP@50-95 |
-|---|---|---|---|---|
-| **All** | **0.84** | **0.77** | **0.79** | **0.56** |
-| mix | 0.67 | 0.82 | 0.76 | 0.59 |
-| signature | 0.87 | 0.79 | 0.88 | 0.48 |
-| stamp | 0.99 | 0.71 | 0.74 | 0.60 |
+### Test set: 55 images, 61 marks, never used for any decision
 
-### Validation set (111 images, 122 marks, used to pick the best epoch and the threshold)
+| Class | Precision | Recall | mAP@50 |
+|---|---|---|---|
+| **All** | **0.84** | **0.77** | **0.79** |
+| Mix | 0.67 | 0.82 | 0.76 |
+| Signature | 0.87 | 0.79 | 0.88 |
+| Stamp | 0.99 | 0.71 | 0.74 |
 
-| | Precision | Recall | mAP@50 | mAP@50-95 |
-|---|---|---|---|---|
-| 3 classes (best epoch, 111) | 0.79 | 0.90 | 0.91 | 0.69 |
-| Any mark, class ignored | 0.88 | 0.93 | 0.94 | 0.66 |
+### What the mistakes look like
 
-**Reading these numbers**
-- **Class-agnostic recall (0.93) is higher than per-class recall.** The confusion matrix shows why: only 1 of 122 validation marks was missed entirely, while 18 of 66 signatures were labelled "mix". Where a signature ends and "signature over stamp" begins is partly a labelling judgement. For the portal's real question ("is this certificate signed and stamped?") this confusion matters less than the per-class numbers suggest.
-- **Signature boxes are the loosest** (mAP@50-95 0.48): signatures have no sharp edges, so box extents vary between annotations.
-- **The test set is small.** One stamp is ~6 recall points, so treat differences under ~5 points as noise.
+On the validation set (122 marks), the model missed **only 1 mark entirely**. Almost all of its errors were picking the wrong label, mostly calling a plain signature a "mix" (18 of 66 signatures).
 
-**Confidence threshold:** the API uses `conf=0.3`, the best overall F1 (0.83) on the validation set. F1 is flat between about 0.25 and 0.7, so results are not sensitive to the exact value.
+That makes sense: where a signature ends and "signature over a stamp" begins is partly a judgement call, even for the person labelling. And for the portal's real question, "is this certificate signed and stamped?", a mix-up between those two labels matters much less than a missed mark.
+
+If you ignore the labels and just ask "did it find a mark?", recall on validation is **0.93**.
+
+A few more things worth knowing:
+- **Signature boxes are the least precise.** Signatures don't have sharp edges, so where exactly the box should go varies.
+- **The test set is small.** One stamp is worth about 6 recall points, so differences under about 5 points are just noise.
+- **Confidence threshold:** the API keeps detections with confidence 0.3 or higher, which gave the best balance of precision and recall on validation. Results barely change anywhere between 0.25 and 0.7.
+
+Full numbers and the confusion matrix are in [`reports/evaluation.md`](reports/evaluation.md).
 
 ![F1 curve](yolo_model/yolo26s_clean/BoxF1_curve.png)
 ![Confusion matrix](yolo_model/yolo26s_clean/confusion_matrix.png)
 
----
+## The data
 
-## The data-leakage fix
-
-The first model (YOLOv8s, 800px, 250 epochs) reported 0.88 mAP@50 on validation. A leakage check (`tools/check_leakage.py`) compared every image across splits with perceptual hashes (pHash and dHash) and found **103 near-duplicate pairs**: the same certificate recoloured, greyscaled, brightened, or with its signature removed, uploaded as separate images and then split randomly. Roughly 15–30% of validation images had a copy in the training set.
-
-Fix (`tools/make_clean_split.py`):
-1. Group all images whose hashes differ by ≤ 8 bits (430 groups, largest 11 images).
-2. Shuffle the groups and assign **whole groups** to train / valid / test (70/20/10). (The split used for the model was also checked for balanced class counts; `reports/split_report.csv` records it exactly.)
-3. Re-run the leakage check: **zero** cross-split near-duplicates.
-4. Retrain from the pretrained checkpoint, not from the old model (which had already seen copies of the new test images).
-
-`reports/split_report.csv` lists every image, its old split, new split and duplicate group.
-
-The old 0.88 and the new numbers are **not directly comparable**: both the split and the model changed. A fair comparison is to retrain YOLOv8s on the clean split (see Next steps).
-
-| Model | Split | mAP@50 |
-|---|---|---|
-| YOLOv8s (original) | leaky validation | 0.88 (inflated) |
-| YOLO26s (`yolo26s_clean`) | clean validation | 0.91 |
-| YOLO26s (`yolo26s_clean`) | **clean test** | **0.79** |
-
----
-
-## Dataset
-
-| Split | Images | Signature | Stamp | Mix |
+| Split | Images | Signatures | Stamps | Mix |
 |---|---|---|---|---|
-| train | 389 | 221 | 105 | 84 |
-| valid | 111 | 66 | 31 | 25 |
-| test | 55 | 33 | 17 | 11 |
+| Train | 389 | 221 | 105 | 84 |
+| Validation | 111 | 66 | 31 | 25 |
+| Test | 55 | 33 | 17 | 11 |
 
-- ~350 real internship certificates photographed by hand, ~205 certificate templates for layout variety.
-- 147 images (26%) contain no marks; many are copies with the signature removed. They act as negatives, teaching the model not to fire on empty signature areas.
-- Exported from Roboflow at 640×640 (stretched) with adaptive contrast equalisation; no Roboflow augmentation.
-- **The dataset is private.** Real certificates contain names, signatures and company stamps (personal data under GDPR), so they are not published in this repository.
+- About 350 real internship certificates I photographed, plus about 205 certificate templates for variety in layout.
+- 147 images (26%) have no marks at all. Many are copies with the signature removed. These teach the model not to fire on an empty signature line.
+- Labelled by hand in Roboflow, exported at 640×640.
+- **The dataset is private.** Real certificates contain names, signatures and company stamps, which are personal data under GDPR, so I can't publish them.
 
-## Model and training
+## Training
 
 | Setting | Value |
 |---|---|
-| Base model | YOLO26s, COCO-pretrained (Ultralytics 8.4.183) |
+| Starting model | YOLO26s, pretrained on COCO |
 | Image size | 640 |
-| Epochs | 150 (patience 50), best epoch 111 |
-| Batch | 16 |
-| Hardware | Google Colab, Tesla T4 |
+| Epochs | 150 (stops early after 50 with no improvement); best was epoch 111 |
+| Batch size | 16 |
+| Hardware | Google Colab, Tesla T4 GPU |
 
-Full settings: `yolo_model/yolo26s_clean/args.yaml`. Training curves: `yolo_model/yolo26s_clean/results.png`.
+Speed: about 16 ms per image on a T4. Full settings are in `yolo_model/yolo26s_clean/args.yaml`.
 
----
+## Run it
 
-## API
+### With Docker (easiest)
 
-### Run locally
+```bash
+docker build -t sign-stamp-api .
+docker run -p 8000:8000 sign-stamp-api
+```
+
+Then open http://localhost:8000/docs.
+
+### Without Docker
 
 ```bash
 python -m venv venv
@@ -105,30 +140,32 @@ pip install -r requirements.txt
 uvicorn app:app --reload
 ```
 
-Interactive docs: http://127.0.0.1:8000/docs
+Then open http://127.0.0.1:8000/docs.
 
-Configuration (environment variables):
+### Settings
 
-| Variable | Default | Meaning |
+| Variable | Default | What it does |
 |---|---|---|
-| `MODEL_PATH` | `yolo_model/yolo26s_clean/weights/best.pt` | Model weights |
-| `CONF_THRESHOLD` | `0.3` | Minimum detection confidence |
+| `MODEL_PATH` | `yolo_model/yolo26s_clean/weights/best.pt` | Which model weights to load |
+| `CONF_THRESHOLD` | `0.3` | Ignore detections below this confidence |
 
-### Endpoints
+With Docker, pass them with `-e`, for example `docker run -p 8000:8000 -e CONF_THRESHOLD=0.5 sign-stamp-api`.
 
-| Method | Path | Description |
+## Using the API
+
+| Method | Path | What it does |
 |---|---|---|
-| GET | `/test` | Health check |
-| POST | `/detect` | Upload an image or PDF (`file` form field); returns detections per page |
+| GET | `/health` | Check the API is running and which model is loaded |
+| POST | `/detect` | Upload an image or PDF (form field `file`); get detections for every page |
 
-Optional query parameter for `/detect`: `include_image` (default `true`). Set `include_image=false` to return only the detections, without the annotated image; the response shrinks from about 200 KB to under 1 KB per page.
+By default `/detect` also returns the page with boxes drawn on it. Add `include_image=false` if you only need the detections; the response shrinks from about 200 KB to under 1 KB per page.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/detect -F "file=@certificate.pdf"
 curl -X POST "http://127.0.0.1:8000/detect?include_image=false" -F "file=@certificate.pdf"
 ```
 
-Response (one entry per page):
+The response has one entry per page:
 
 ```json
 {
@@ -141,55 +178,53 @@ Response (one entry per page):
 }
 ```
 
-`bbox` is `[x, y, width, height]` in pixels. `image_with_annotations` is the page with boxes and labels drawn on it.
+`bbox` is `[x, y, width, height]` in pixels.
 
----
+## Limits and responsible use
 
-## Limitations and responsible use
+- **It's a helper, not the final check.** It misses about 7% of marks, so it should flag documents for a person to review, not reject them automatically.
+- **One source of data.** It was built for one university portal. Other document styles, photos taken at steep angles, or faded stamps haven't been tested.
+- **Small test set** (61 marks), so expect results to vary by a few points on new data.
+- **Personal data.** Uploaded documents contain personal data. The API deletes the upload and every image it makes from it after each request, even if something fails. Any real deployment should still follow GDPR rules on keeping data.
+- **Known issue:** PDF pages are rendered at 72 dpi, which may be too low for very faint signatures.
 
-- **Assistive, not a final check.** With ~7% of marks missed, the tool should flag documents for human review rather than reject them automatically.
-- **Small, single-source dataset.** Collected for one university portal; other document styles, phone photos at steep angles, or faded stamps are untested.
-- **Small test set** (61 marks): expect several points of variation on new data.
-- **Personal data.** Uploaded documents contain personal data. The API deletes the upload, its PNG copy and any PDF page images after every request, including failed ones; deployments should still follow GDPR retention rules.
-
-## Known issues
-
-- PDF pages are rendered at the PyMuPDF default resolution (72 dpi), which may be low for faint signatures.
-
-## Reproduce
+## Reproduce it
 
 ```bash
 pip install pillow imagehash
-python tools/check_leakage.py path/to/dataset                         # find cross-split duplicates
-python tools/make_clean_split.py path/to/dataset path/to/clean_split  # leak-free re-split
+python tools/check_leakage.py path/to/dataset                         # find duplicates across splits
+python tools/make_clean_split.py path/to/dataset path/to/clean_split  # build the leak-free split
 yolo detect train data=path/to/clean_split/data.yaml model=yolo26s.pt epochs=150 patience=50 imgsz=640 seed=0
 yolo detect val model=runs/detect/train/weights/best.pt data=path/to/clean_split/data.yaml split=test
 ```
 
-## Project layout
+The leakage tools work on any image dataset in YOLO format, not just this one.
+
+## What's in the repo
 
 ```
-app.py                     FastAPI app (/test, /detect)
-functions.py               PDF to images, detection, helpers
+app.py                  the API (/health, /detect)
+functions.py            PDF to images, running the model, drawing boxes
+Dockerfile              run the API in one command
 requirements.txt
 yolo_model/
-  yolo26s_clean/           model weights, training curves, F1/PR curves, confusion matrix, args
+  yolo26s_clean/        model weights, training curves, confusion matrix, settings
 tools/
-  check_leakage.py         cross-split duplicate check (perceptual hashing)
-  make_clean_split.py      group-aware re-split
+  check_leakage.py      find near-duplicate images across splits
+  make_clean_split.py   rebuild the split so duplicates stay together
 reports/
-  evaluation.md            all test/validation metrics, threshold choice, error analysis
-  example_prediction.jpg   sample output on a certificate template
-  split_report.csv         old vs new split for every image
+  evaluation.md         every number, the threshold choice, and the error analysis
+  example_prediction.jpg
+  split_report.csv      old vs new split for every image
 ```
 
-## Next steps
+## What's next
 
-- Retrain YOLOv8s on the clean split for a like-for-like comparison with the original model.
-- Learning curve (train on 25/50/75/100% of data) to see whether more data would help.
-- Collect more real "mix" examples and hard cases (angled phone photos, faded stamps).
-- Render PDF pages at a higher resolution and measure the effect on faint signatures.
+- Retrain YOLOv8s on the clean split for a fair before/after comparison.
+- Train on 25/50/75/100% of the data to see whether more data would help.
+- Collect more real "mix" examples and hard cases (angled photos, faded stamps).
+- Render PDF pages at a higher resolution and measure the difference on faint signatures.
 
 ## License
 
-Code in this repository: MIT (see `LICENSE`). The model is trained and run with [Ultralytics YOLO](https://github.com/ultralytics/ultralytics), which is distributed under its own licence (AGPL-3.0 at the time of writing); the model weights and any deployment are subject to those terms.
+The code here is MIT (see `LICENSE`). The model is trained and run with [Ultralytics YOLO](https://github.com/ultralytics/ultralytics), which has its own licence (AGPL-3.0 at the time of writing), so the model weights and any deployment follow those terms.

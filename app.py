@@ -6,7 +6,13 @@ import uuid
 import sys
 import warnings
 import logging
-from functions import detect_signatures_and_stamps, pdf_pages_to_images, convert_to_png
+from functions import (
+    detect_signatures_and_stamps,
+    pdf_pages_to_images,
+    convert_to_png,
+    MODEL_PATH,
+    CONF_THRESHOLD,
+)
 
 if not sys.warnoptions:
     warnings.simplefilter("ignore")
@@ -32,9 +38,10 @@ def secure_filename(filename: str) -> str:
     filename = _filename_ascii_strip_re.sub('', filename)
     return filename
 
-@app.get("/test")
-async def test():
-    return {"Message": "Hello User, API is Working."}
+@app.get("/health")
+async def health():
+    """Check that the API is running and which model is loaded."""
+    return {"status": "ok", "model": MODEL_PATH, "conf_threshold": CONF_THRESHOLD}
 
 @app.post("/detect")
 async def detect_certificates(

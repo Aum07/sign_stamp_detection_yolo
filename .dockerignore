@@ -1,0 +1,19 @@
+# Windows virtual environment in the project root
+Include/
+Lib/
+Library/
+Scripts/
+share/
+pyvenv.cfg
+venv/
+.venv/
+
+# Not needed in the image
+.git/
+__pycache__/
+*.pyc
+data/
+reports/
+tools/
+runs/
+.env
